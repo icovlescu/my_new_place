@@ -1,0 +1,25 @@
+name = "my-new-place"
+main = "src/worker.js"
+compatibility_date = "2025-09-01"
+
+# Served at https://covlescu.com/my_new_place. The zone must be on Cloudflare.
+# The pattern is more specific than a catch-all route, so it wins over any Worker already bound to covlescu.com.
+routes = [{ pattern = "covlescu.com/my_new_place*", zone_name = "covlescu.com" }]
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "my_new_place"
+database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+migrations_dir = "migrations"
+
+[vars]
+# OAuth client id of a "Web application" credential in Google Cloud Console (public value, not a secret).
+GOOGLE_CLIENT_ID = ""
+# Optional comma-separated allow-list of emails. Empty = any verified Google account.
+ALLOWED_EMAILS = ""
+# Secret (set with `wrangler secret put SESSION_SECRET`): a long random string used to sign session cookies.

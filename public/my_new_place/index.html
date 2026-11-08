@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>my_new_place – discover the skills you already have</title>
+  <link rel="stylesheet" href="/my_new_place/style.css">
+</head>
+<body>
+  <header>
+    <h1><a href="/my_new_place/">my_new_place</a></h1>
+    <nav id="nav" hidden>
+      <button data-tab="match" class="tab">Match a job</button>
+      <button data-tab="graph" class="tab">Skill graph</button>
+      <button data-tab="profile" class="tab">My profile</button>
+      <button data-tab="evidence" class="tab">Evidence</button>
+    </nav>
+    <div id="who"></div>
+  </header>
+  <main id="app"><p class="muted">Loading…</p></main>
+  <div id="modal" class="modal" hidden><div class="modal-body" id="modal-body"></div></div>
+  <script type="module" src="/my_new_place/app.js"></script>
+</body>
+</html>
