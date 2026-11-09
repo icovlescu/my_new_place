@@ -14,7 +14,7 @@ run_worker_first = true
 [[d1_databases]]
 binding = "DB"
 database_name = "my_new_place"
-database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+database_id = "5b1e6104-b4d6-411a-9018-cd02400d5f85"
 migrations_dir = "migrations"
 
 [vars]
