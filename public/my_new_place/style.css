@@ -34,3 +34,6 @@ th { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(-
 .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; vertical-align:-1px; }
 .side { position:absolute; top:10px; right:10px; width:290px; max-height:calc(100% - 20px); overflow:auto; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 14px; font-size:13px; }
 @media (max-width:700px) { .side { position:static; width:auto; margin-top:8px; } }
+
+.cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; } .cards .card { margin:0; }
+details.card summary { cursor:pointer; font-weight:600; }

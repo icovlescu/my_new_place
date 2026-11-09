@@ -2,12 +2,14 @@ import { SKILLS, SKILL_BY_ID, ROLES, ROLE_BY_ID, ANCHORS, LEVEL_NAMES, CATEGORIE
 import { extractSkills, extractRequirements, detectRole, linkedinCsvToText } from './extract.js';
 import { skillLevels, claimLevelFromMentions, surveyLevel, clampLevel, TIERS, TIER_LABEL, TIER_CAP } from './evidence.js';
 import { analyse, roleRequirements, extraStrengths, buildGraph } from './gap.js';
+import { TASK_BY_ID, instantiate, listTasks, tasksForSkill } from './tasks.js';
+import { newToken, cleanDeclared, cleanResolutions, defaultDeclared, applicationItems, summarise } from './application.js';
 import { signSession, verifySession, verifyGoogleIdToken, getGoogleJwks, parseCookies } from './auth.js';
 
 export const BASE = '/my_new_place';
 const COOKIE = 'mnp_session';
 const SESSION_MS = 14 * 24 * 3600 * 1000;
-const LIMITS = { cv: 60000, linkedin: 60000, job: 30000, evidence: 300, jobs: 30, short: 200 };
+const LIMITS = { cv: 60000, linkedin: 60000, job: 30000, evidence: 300, jobs: 30, short: 200, applications: 20, requests: 5, answer: 12000 };
 
 const json = (data, status = 200, headers = {}) =>
   new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers } });
@@ -252,6 +254,155 @@ route('GET', '/api/graph', async (ctx) => {
   return json({ overlay: label, ...buildGraph(levels, reqs) });
 });
 
+// ---- Assessment tasks (template layer; answers are stored, not scored) ----
+const randomSeed = () => (crypto.getRandomValues(new Uint32Array(1))[0] % 1000000) + 1;
+
+route('GET', '/api/tasks', async (ctx) => json({ tasks: listTasks(ctx.url.searchParams.get('role') || null), generator: 'template', scoring: 'none' }));
+
+route('GET', '/api/tasks/:id', async (ctx) => {
+  const seed = Number(ctx.url.searchParams.get('seed')) || randomSeed();
+  const t = instantiate(ctx.params.id, seed);
+  return t ? json(t) : fail(404, 'Unknown task.');
+});
+
+route('POST', '/api/tasks/:id/submit', async (ctx) => {
+  const t = TASK_BY_ID[ctx.params.id];
+  if (!t) return fail(404, 'Unknown task.');
+  const b = await ctx.body();
+  const answer = str(b.answer, LIMITS.answer);
+  if (answer.length < 80) return fail(400, 'Write your answer first (at least a few sentences).');
+  const seed = Math.max(1, Math.round(Number(b.seed)) || randomSeed());
+  let requestId = null;
+  if (b.request_id) {
+    const rq = await ctx.env.DB.prepare('SELECT r.id, r.status, r.task_id FROM assessment_requests r JOIN applications a ON a.id = r.application_id WHERE r.id = ? AND a.user_id = ?').bind(Number(b.request_id), ctx.user.id).first();
+    if (!rq || rq.status === 'declined') return fail(404, 'Request not found or declined.');
+    if (rq.task_id && rq.task_id !== t.id) return fail(400, 'This request is for a different task.');
+    requestId = rq.id;
+  }
+  const r = await ctx.env.DB.prepare('INSERT INTO task_submissions (user_id, task_id, seed, request_id, answer, shared) VALUES (?,?,?,?,?,?)')
+    .bind(ctx.user.id, t.id, seed, requestId, answer, b.share_with_employer === false ? 0 : 1).run();
+  if (requestId) await ctx.env.DB.prepare("UPDATE assessment_requests SET status = 'submitted', updated_at = datetime('now') WHERE id = ?").bind(requestId).run();
+  return json({ ok: true, id: r.meta?.last_row_id ?? null, status: 'submitted', scored: false, note: 'Saved. There is no scoring step yet, so this does not change your level. If you shared it, the employer sees it as submitted and not scored.' }, 201);
+});
+
+// ---- Applications: the candidate states levels; the employer can request an assessment; the candidate decides ----
+async function buildApplicationView(env, app, levels, { forEmployer = false } = {}) {
+  const reqs = JSON.parse(app.requirements);
+  const declared = JSON.parse(app.declared);
+  const resolutions = JSON.parse(app.resolutions);
+  const { results: rq } = await env.DB.prepare('SELECT id, skill_id, task_id, seed, requested_by, note, status, created_at FROM assessment_requests WHERE application_id = ? ORDER BY id').bind(app.id).all();
+  const bySkill = new Map(rq.map((r) => [r.skill_id, r]));
+  const items = applicationItems(reqs, levels, declared, resolutions, bySkill);
+  const base = { id: app.id, title: app.title, role_id: app.role_id, display_name: app.display_name, summary: summarise(items), items };
+  if (forEmployer) {
+    const { results: subs } = await env.DB.prepare('SELECT request_id, answer, shared, created_at FROM task_submissions WHERE request_id IN (SELECT id FROM assessment_requests WHERE application_id = ?) ORDER BY id').bind(app.id).all();
+    const latest = new Map(subs.map((s) => [s.request_id, s]));
+    for (const it of items) {
+      if (!it.request) continue;
+      const s = latest.get(it.request.id);
+      it.request = { status: it.request.status, requested_by: it.request.requested_by, note: it.request.note,
+        submission: s ? { scored: false, answer: s.shared ? s.answer : null, shared: !!s.shared } : null };
+    }
+    return base;
+  }
+  return { ...base, share_token: app.share_token, requests: rq, flagged: items.filter((i) => i.flag === 'above_evidence').map((i) => i.skill) };
+}
+
+async function ownApplication(ctx) {
+  return ctx.env.DB.prepare('SELECT * FROM applications WHERE id = ? AND user_id = ?').bind(Number(ctx.params.id), ctx.user.id).first();
+}
+
+route('GET', '/api/applications', async (ctx) => {
+  const { results } = await ctx.env.DB.prepare(`SELECT a.id, a.title, a.role_id, a.display_name, a.updated_at,
+    (SELECT COUNT(*) FROM assessment_requests r WHERE r.application_id = a.id AND r.status = 'pending') AS pending
+    FROM applications a WHERE a.user_id = ? ORDER BY a.id DESC`).bind(ctx.user.id).all();
+  return json({ applications: results });
+});
+
+route('POST', '/api/applications', async (ctx) => {
+  const b = await ctx.body();
+  let reqs, title = str(b.title, LIMITS.short), roleId = null;
+  if (b.job_id) {
+    const job = await ctx.env.DB.prepare('SELECT title, text, role_id FROM jobs WHERE id = ? AND user_id = ?').bind(Number(b.job_id), ctx.user.id).first();
+    if (!job) return fail(404, 'Job not found.');
+    reqs = extractRequirements(job.text, job.title); title = title || job.title || 'Application'; roleId = job.role_id;
+  } else if (b.role_id) {
+    reqs = roleRequirements(b.role_id);
+    if (!reqs) return fail(404, 'Unknown role.');
+    roleId = b.role_id; title = title || ROLE_BY_ID[b.role_id].title;
+  } else return fail(400, 'Choose a saved job or a role.');
+  if (!reqs.length) return fail(422, 'No requirements to apply against.');
+  const { n } = await ctx.env.DB.prepare('SELECT COUNT(*) AS n FROM applications WHERE user_id = ?').bind(ctx.user.id).first();
+  if (n >= LIMITS.applications) return fail(400, 'Application limit reached. Remove an old one first.');
+  const { levels } = await loadLevels(ctx.env, ctx.user.id);
+  const declared = b.declared ? cleanDeclared(b.declared, reqs) : defaultDeclared(reqs, levels);
+  const r = await ctx.env.DB.prepare('INSERT INTO applications (user_id, title, role_id, display_name, requirements, declared, share_token) VALUES (?,?,?,?,?,?,?)')
+    .bind(ctx.user.id, title, roleId, str(b.display_name, 80) || 'Candidate', JSON.stringify(reqs), JSON.stringify(declared), newToken()).run();
+  const app = await ctx.env.DB.prepare('SELECT * FROM applications WHERE id = ?').bind(r.meta.last_row_id).first();
+  return json(await buildApplicationView(ctx.env, app, levels), 201);
+});
+
+route('GET', '/api/applications/:id', async (ctx) => {
+  const app = await ownApplication(ctx);
+  if (!app) return fail(404, 'Application not found.');
+  const { levels } = await loadLevels(ctx.env, ctx.user.id);
+  return json(await buildApplicationView(ctx.env, app, levels));
+});
+
+route('PUT', '/api/applications/:id', async (ctx) => {
+  const app = await ownApplication(ctx);
+  if (!app) return fail(404, 'Application not found.');
+  const b = await ctx.body();
+  const reqs = JSON.parse(app.requirements);
+  const declared = b.declared ? JSON.stringify(cleanDeclared(b.declared, reqs)) : app.declared;
+  const resolutions = b.resolutions ? JSON.stringify(cleanResolutions(b.resolutions, reqs)) : app.resolutions;
+  const name = b.display_name !== undefined ? (str(b.display_name, 80) || 'Candidate') : app.display_name;
+  await ctx.env.DB.prepare("UPDATE applications SET declared = ?, resolutions = ?, display_name = ?, updated_at = datetime('now') WHERE id = ?").bind(declared, resolutions, name, app.id).run();
+  const { levels } = await loadLevels(ctx.env, ctx.user.id);
+  return json(await buildApplicationView(ctx.env, { ...app, declared, resolutions, display_name: name }, levels));
+});
+
+route('DELETE', '/api/applications/:id', async (ctx) => {
+  await ctx.env.DB.prepare('DELETE FROM applications WHERE id = ? AND user_id = ?').bind(Number(ctx.params.id), ctx.user.id).run();
+  return json({ ok: true });
+});
+
+route('POST', '/api/requests/:id/respond', async (ctx) => {
+  const b = await ctx.body();
+  if (!['accept', 'decline'].includes(b.action)) return fail(400, 'action must be accept or decline.');
+  const rq = await ctx.env.DB.prepare('SELECT r.* FROM assessment_requests r JOIN applications a ON a.id = r.application_id WHERE r.id = ? AND a.user_id = ?').bind(Number(ctx.params.id), ctx.user.id).first();
+  if (!rq) return fail(404, 'Request not found.');
+  if (rq.status === 'submitted') return fail(400, 'Already submitted.');
+  const status = b.action === 'accept' ? 'accepted' : 'declined';
+  await ctx.env.DB.prepare("UPDATE assessment_requests SET status = ?, updated_at = datetime('now') WHERE id = ?").bind(status, rq.id).run();
+  return json({ ok: true, status, task: status === 'accepted' && rq.task_id ? { id: rq.task_id, seed: rq.seed } : null });
+});
+
+// ---- Employer side: read-only link. No account, no email, no ranking; the employer may ask for an assessment. ----
+route('GET', '/api/share/:token', async (ctx) => {
+  const app = await ctx.env.DB.prepare('SELECT * FROM applications WHERE share_token = ?').bind(ctx.params.token).first();
+  if (!app) return fail(404, 'This link is not valid.');
+  const { levels } = await loadLevels(ctx.env, app.user_id);
+  return json({ ...(await buildApplicationView(ctx.env, app, levels, { forEmployer: true })), canRequest: LIMITS.requests });
+});
+
+route('POST', '/api/share/:token/request', async (ctx) => {
+  const app = await ctx.env.DB.prepare('SELECT * FROM applications WHERE share_token = ?').bind(ctx.params.token).first();
+  if (!app) return fail(404, 'This link is not valid.');
+  const b = await ctx.body();
+  const reqs = JSON.parse(app.requirements);
+  if (!reqs.some((r) => r.skill === b.skill)) return fail(400, 'That skill is not part of this application.');
+  const { n } = await ctx.env.DB.prepare('SELECT COUNT(*) AS n FROM assessment_requests WHERE application_id = ?').bind(app.id).first();
+  if (n >= LIMITS.requests) return fail(429, 'The request limit for this application is reached.');
+  const exists = await ctx.env.DB.prepare('SELECT id FROM assessment_requests WHERE application_id = ? AND skill_id = ?').bind(app.id, b.skill).first();
+  if (exists) return fail(409, 'An assessment was already requested for this skill.');
+  const role = reqs.find((r) => r.skill === b.skill);
+  const task = tasksForSkill(b.skill, app.role_id)[0] || tasksForSkill(b.skill)[0] || null;
+  await ctx.env.DB.prepare('INSERT INTO assessment_requests (application_id, skill_id, task_id, seed, requested_by, note) VALUES (?,?,?,?,?,?)')
+    .bind(app.id, b.skill, task ? task.id : null, randomSeed(), str(b.requested_by, 80) || 'Hiring team', str(b.note, 300)).run();
+  return json({ ok: true, status: 'pending', hasTask: !!task, requiredLevel: role.level }, 201);
+});
+
 export function createHandler(deps = {}) {
   return async function fetch(request, env, ctx0) {
     const url = new URL(request.url);
@@ -268,7 +419,7 @@ export function createHandler(deps = {}) {
     const r = routes.find((x) => x.method === request.method && x.re.test(apiPath));
     if (!r) return fail(404, 'Not found');
     const params = apiPath.match(r.re).groups || {};
-    const isPublic = ['/api/config', '/api/ontology', '/api/auth/google', '/api/auth/dev', '/api/auth/logout', '/api/me'].includes(apiPath);
+    const isPublic = ['/api/config', '/api/ontology', '/api/auth/google', '/api/auth/dev', '/api/auth/logout', '/api/me'].includes(apiPath) || apiPath.startsWith('/api/share/');
     const user = await currentUser(request, env);
     if (!user && !isPublic) return fail(401, 'Not signed in');
     const body = async () => {

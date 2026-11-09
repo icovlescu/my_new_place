@@ -56,3 +56,13 @@ Stores your profile text, evidence and saved jobs in D1 under your Google email.
 ## Status
 
 Not yet run under `wrangler dev` or deployed (built without registry access). Logic, API and auth are covered by `npm test`; the browser UI has only been syntax-checked.
+
+
+## Applications and assessment tasks (added)
+
+- **Applications tab**: from a job match, "Prepare an application". You state a level per requirement; the page shows what your evidence supports next to it and flags levels stated above the evidence. For each gap you pick: do a task, add evidence, or submit with the gap visible. Every requirement is always listed, so a gap cannot be hidden by omission.
+- **Employer link** (`/my_new_place/?share=<token>`): read-only, no account, no email, no overall score or ranking. The employer can request an assessment for a skill (max 5); you accept or decline, and a decline is visible.
+- **Tasks tab**: parametrised work samples for Senior Data Scientist and Manager, Data Science & Analytics. A seed fixes the numbers. These are templates today; an LLM generator is meant to produce more variants in the same shape (`brief` field per task).
+- **Not scored yet**: answers are stored and never change a level. Only a scoring step (human reviewer or a validated rubric) may create `test` evidence.
+
+Apply migrations again (`npm run db:remote`) to create the new tables.

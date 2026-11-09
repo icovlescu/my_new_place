@@ -2,7 +2,7 @@ import { createGraph, TIER_COLOR } from '/my_new_place/graph.js';
 
 const BASE = '/my_new_place';
 const app = document.getElementById('app');
-const state = { cfg: null, ont: null, me: null, tab: 'match', overlay: { type: '', id: '' } };
+const state = { cfg: null, ont: null, me: null, tab: 'match', overlay: { type: '', id: '' }, appId: null };
 const TIER_LABEL = { claim: 'Claimed', survey: 'Self-assessed', badge: 'Badge', reference: 'Reference', test: 'Measured' };
 const STATUS_TEXT = { met: 'Met', close: 'Close', transferable: 'Transferable', gap: 'Gap', missing: 'Missing' };
 
@@ -130,7 +130,7 @@ async function start() {
 function show(tab) {
   state.tab = tab;
   document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-  ({ match: renderMatch, graph: renderGraph, profile: renderProfile, evidence: renderEvidence })[tab]();
+  ({ match: renderMatch, graph: renderGraph, applications: renderApplications, tasks: renderTasks, profile: renderProfile, evidence: renderEvidence })[tab]().catch?.((e) => app.replaceChildren(msg(e.message)));
 }
 document.getElementById('nav').addEventListener('click', (e) => { const t = e.target.dataset?.tab; if (t) show(t); });
 
@@ -201,9 +201,160 @@ function showAnalysis(box, res, rerun) {
     a.hiddenFit.length ? el('div', { class: 'card' }, el('b', {}, 'You may already have these in a different setting'), el('ul', {}, a.hiddenFit.map((i) => el('li', {}, `${i.label}: your ${i.transfer.fromLabel} (L${i.transfer.fromLevel}) carries over to about L${i.transfer.level}. Add a reference or example from that work to make it count.`)))) : null,
     res.strengths && res.strengths.length ? el('div', { class: 'card' }, el('b', {}, 'Strengths this role does not ask for, but you could mention'), el('p', {}, res.strengths.map((s) => `${s.label} (L${s.level})`).join(' · '))) : null,
     el('div', { class: 'row' },
+      el('button', { class: 'btn', onclick: async () => {
+        await guarded(box, async () => {
+          const a = await api('/applications', 'POST', res.jobId ? { job_id: res.jobId } : { role_id: res.roleId });
+          state.appId = a.id; show('applications');
+        });
+      } }, 'Prepare an application from this'),
       el('button', { class: 'btn secondary', onclick: () => { state.overlay = res.jobId ? { type: 'job', id: res.jobId } : { type: 'role', id: res.roleId }; show('graph'); } }, 'See this on my skill graph'),
     ),
     el('p', { class: 'muted small' }, 'Requirements are read from the text with simple rules (keywords, years, “nice to have” sections). Check the levels before relying on them.'),
+  );
+}
+
+// ---------- tasks (template mockups of the AI-generated assessment tasks) ----------
+const roleTitle = (id) => state.ont.roles.find((r) => r.id === id)?.title || id;
+const TASK_ROLES = { senior_data_scientist: 'Senior Data Scientist', ds_manager: 'Manager, Data Science & Analytics' };
+
+async function renderTasks() {
+  const { tasks } = await api('/tasks');
+  const groups = Object.entries(TASK_ROLES).map(([role, title]) => el('div', {},
+    el('h3', {}, title),
+    el('div', { class: 'cards' }, tasks.filter((t) => t.role === role).map((t) => el('div', { class: 'card' },
+      el('b', {}, t.title), el('div', { class: 'muted small' }, `${t.minutes} min · ${t.deliverable}`),
+      el('div', { style: 'margin:8px 0' }, t.skills.map((s) => pill('', `${skillLabel(s.skill)} L${s.level}`))),
+      el('button', { class: 'btn small', onclick: () => renderTask(t.id, null, null, () => show('tasks')) }, 'Open a practice version'))))));
+  app.replaceChildren(
+    el('h2', {}, 'Assessment tasks'),
+    el('p', { class: 'muted' }, 'Short, realistic work samples for roles where a self-assessment is not enough. Each opening generates a variant with different numbers, so a shared answer does not transfer.'),
+    msg('Mockup stage: variants come from templates today, and an AI generator will produce more in the same shape. Answers are stored but not scored yet, so a task does not change your level. A human or validated scoring step comes before any task can count as measured evidence.', 'ok'),
+    ...groups,
+  );
+}
+
+async function renderTask(taskId, seed, requestId, back) {
+  const t = await api(`/tasks/${taskId}${seed ? `?seed=${seed}` : ''}`);
+  const ans = el('textarea', { style: 'min-height:220px', placeholder: 'Write your answer. Keep to the deliverable and the time box.' });
+  const share = el('input', { type: 'checkbox', checked: true });
+  const out = el('div');
+  const submit = el('button', { class: 'btn', onclick: async () => {
+    submit.disabled = true;
+    await guarded(out, async () => {
+      const r = await api(`/tasks/${t.id}/submit`, 'POST', { seed: t.seed, answer: ans.value, request_id: requestId, share_with_employer: share.checked });
+      out.replaceChildren(msg(r.note, 'ok'));
+    });
+    submit.disabled = false;
+  } }, 'Submit answer');
+  app.replaceChildren(
+    el('button', { class: 'btn secondary small', onclick: back }, '← Back'),
+    el('h2', { style: 'margin-top:10px' }, t.title),
+    el('p', { class: 'muted small' }, `${roleTitle(t.role)} · about ${t.minutes} minutes · variant ${t.seed} · template-generated`),
+    el('div', { class: 'card' }, el('b', {}, 'Scenario'), el('p', {}, t.scenario),
+      el('table', {}, el('thead', {}, el('tr', {}, t.data.columns.map((c) => el('th', {}, c)))), el('tbody', {}, t.data.rows.map((r) => el('tr', {}, r.map((c) => el('td', {}, String(c))))))),
+      t.data.extra.map((x) => el('p', { class: 'muted small' }, x))),
+    el('div', { class: 'card' }, el('b', {}, 'Questions'), el('ol', {}, t.questions.map((q) => el('li', {}, q))), el('p', { class: 'muted small' }, `Deliverable: ${t.deliverable}`)),
+    el('details', { class: 'card' }, el('summary', {}, 'How answers will be read'), el('table', {}, el('thead', {}, el('tr', {}, ['Criterion', 'Level 3', 'Level 4', 'Level 5'].map((h) => el('th', {}, h)))),
+      el('tbody', {}, t.rubric.map((r) => el('tr', {}, el('td', {}, r.criterion), el('td', {}, r.signals[3]), el('td', {}, r.signals[4]), el('td', {}, r.signals[5])))))),
+    ans, el('label', { class: 'anchor' }, share, el('span', {}, 'Share this answer with the employer who requested it')), out, el('div', { style: 'margin-top:10px' }, submit),
+  );
+}
+
+// ---------- applications: the candidate states levels and decides ----------
+async function renderApplications() {
+  if (state.appId) return renderApplication(state.appId);
+  const { applications } = await api('/applications');
+  app.replaceChildren(
+    el('h2', {}, 'Applications'),
+    el('p', { class: 'muted' }, 'You state your level for each requirement and decide how to handle each gap. Employers see your stated level next to what your evidence supports, and may ask for an assessment, which you can accept or decline.'),
+    applications.length ? el('div', { class: 'card' }, el('table', {}, el('thead', {}, el('tr', {}, ['Application', 'Updated', 'Pending requests', ''].map((h) => el('th', {}, h)))),
+      el('tbody', {}, applications.map((a) => el('tr', {}, el('td', {}, a.title), el('td', { class: 'muted' }, a.updated_at), el('td', {}, a.pending ? pill('gap', `${a.pending} waiting`) : '–'),
+        el('td', {}, el('button', { class: 'btn small', onclick: () => { state.appId = a.id; renderApplications(); } }, 'Open'), ' ',
+          el('button', { class: 'btn danger small', onclick: async () => { await api(`/applications/${a.id}`, 'DELETE'); renderApplications(); } }, 'Delete'))))))) : el('p', { class: 'muted' }, 'None yet. Run a job match and choose “Prepare an application from this”.'),
+  );
+}
+
+async function renderApplication(id) {
+  const a = await api(`/applications/${id}`);
+  const declared = {}; const resolutions = {};
+  a.items.forEach((i) => { if (i.stated) declared[i.skill] = i.stated; if (i.resolution) resolutions[i.skill] = i.resolution; });
+  const name = el('input', { value: a.display_name || '' });
+  const FLAG = { above_evidence: ['gap', 'Above evidence'], claim_only: ['', 'Claim only'] };
+  const rows = a.items.map((i) => {
+    const sel = el('select', { onchange: () => { if (sel.value) declared[i.skill] = Number(sel.value); else delete declared[i.skill]; } },
+      el('option', { value: '' }, '–'), [1, 2, 3, 4, 5].map((n) => el('option', { value: n, selected: n === i.stated }, `L${n}`)));
+    const res = el('select', { onchange: () => { if (res.value) resolutions[i.skill] = res.value; else delete resolutions[i.skill]; } },
+      el('option', { value: '' }, 'Not decided'), el('option', { value: 'task', selected: i.resolution === 'task' }, 'Do a task'),
+      el('option', { value: 'evidence', selected: i.resolution === 'evidence' }, 'Add evidence'), el('option', { value: 'disclose', selected: i.resolution === 'disclose' }, 'Submit with the gap'));
+    const q = i.request;
+    return el('tr', {},
+      el('td', {}, el('b', {}, i.label), i.importance === 3 ? el('span', { class: 'muted small' }, ' · must have') : null),
+      el('td', {}, `L${i.required}`), el('td', {}, sel),
+      el('td', {}, i.evidenced ? `L${i.evidenced}` : '–', ' ', el('span', { class: 'muted small' }, i.tierLabel)),
+      el('td', {}, i.flag ? pill(...FLAG[i.flag]) : pill(i.status, STATUS_TEXT[i.status] || i.status)), el('td', {}, res),
+      el('td', {}, q ? requestCell(a, i, q) : el('span', { class: 'muted small' }, 'none')));
+  });
+  const link = `${location.origin}${BASE}/?share=${a.share_token}`;
+  const out = el('div');
+  app.replaceChildren(
+    el('button', { class: 'btn secondary small', onclick: () => { state.appId = null; renderApplications(); } }, '← All applications'),
+    el('h2', { style: 'margin-top:10px' }, a.title),
+    el('div', { class: 'card kpis' },
+      el('div', { class: 'kpi' }, el('span', { class: 'muted small' }, 'Must-haves you state as met'), el('b', {}, `${a.summary.mustHaveStated}/${a.summary.mustHaveTotal}`)),
+      el('div', { class: 'kpi' }, el('span', { class: 'muted small' }, 'Must-haves your evidence supports'), el('b', {}, `${a.summary.mustHaveEvidenced}/${a.summary.mustHaveTotal}`)),
+      el('div', { class: 'kpi' }, el('span', { class: 'muted small' }, 'Levels above your evidence'), el('b', {}, a.summary.flagged))),
+    a.summary.flagged ? msg(`${a.summary.flagged} level${a.summary.flagged > 1 ? 's are' : ' is'} stated above what your evidence supports. The employer sees this and may ask for an assessment. For each one you can do a task, add a badge or reference, or submit with the gap visible.`, 'ok') : null,
+    el('div', { class: 'card' }, el('table', {}, el('thead', {}, el('tr', {}, ['Requirement', 'Asked', 'You state', 'Evidence supports', 'Status', 'Your plan for the gap', 'Employer request'].map((h) => el('th', {}, h)))), el('tbody', {}, rows)),
+      el('p', { class: 'muted small' }, 'All requirements are always shown to the employer, including the ones where you are below the ask.')),
+    el('div', { class: 'row' }, el('div', { class: 'grow' }, el('label', {}, 'Name the employer sees (not your email)'), name)),
+    out,
+    el('div', { class: 'row', style: 'margin-top:10px' },
+      el('button', { class: 'btn', onclick: async () => { await guarded(out, async () => { await api(`/applications/${id}`, 'PUT', { declared, resolutions, display_name: name.value }); renderApplication(id); }); } }, 'Save'),
+      el('button', { class: 'btn secondary', onclick: () => show('evidence') }, 'Add evidence')),
+    el('div', { class: 'card' }, el('b', {}, 'Employer link'), el('p', { class: 'muted small' }, 'Read-only, no account needed. Anyone with this link can view this application and request up to 5 assessments. Delete the application to revoke it.'),
+      el('input', { value: link, readonly: true, onclick: (e) => e.target.select() })),
+  );
+}
+
+function requestCell(a, i, q) {
+  const label = { pending: 'Assessment requested', accepted: 'You accepted', declined: 'You declined', submitted: 'Submitted, not scored' }[q.status];
+  const cell = el('div', {}, pill(q.status === 'declined' ? 'gap' : q.status === 'pending' ? 'close' : 'met', label), q.note ? el('div', { class: 'muted small' }, `“${q.note}”`) : null);
+  const full = a.requests.find((r) => r.skill_id === i.skill);
+  if (q.status === 'pending') cell.append(el('div', { class: 'row', style: 'gap:6px;margin-top:6px' },
+    el('button', { class: 'btn small', onclick: async () => { await api(`/requests/${q.id}/respond`, 'POST', { action: 'accept' }); renderApplication(a.id); } }, 'Accept'),
+    el('button', { class: 'btn danger small', onclick: async () => { await api(`/requests/${q.id}/respond`, 'POST', { action: 'decline' }); renderApplication(a.id); } }, 'Decline')));
+  if (q.status === 'accepted' && q.task_id) cell.append(el('div', { style: 'margin-top:6px' }, el('button', { class: 'btn small', onclick: () => renderTask(q.task_id, full.seed, q.id, () => renderApplication(a.id)) }, 'Start the task')));
+  return cell;
+}
+
+// ---------- employer view (no sign-in; link only) ----------
+async function renderEmployer(token) {
+  document.getElementById('nav').hidden = true;
+  const a = await api(`/share/${token}`);
+  const out = el('div');
+  const by = el('input', { placeholder: 'Your name or team (shown to the candidate)' });
+  const FLAGTXT = { above_evidence: ['gap', 'Stated above evidence'], claim_only: ['', 'Claim only'] };
+  const rows = a.items.map((i) => el('tr', {},
+    el('td', {}, el('b', {}, i.label), i.importance === 3 ? el('span', { class: 'muted small' }, ' · must have') : null),
+    el('td', {}, `L${i.required}`), el('td', {}, i.stated ? `L${i.stated}` : '–'),
+    el('td', {}, i.evidenced ? `L${i.evidenced}` : '–', ' ', el('span', { class: 'muted small' }, i.tierLabel)),
+    el('td', {}, i.flag ? pill(...FLAGTXT[i.flag]) : pill(i.status, STATUS_TEXT[i.status] || i.status)),
+    el('td', {}, i.resolution ? { task: 'Will do a task', evidence: 'Will add evidence', disclose: 'Submitted with the gap' }[i.resolution] : ''),
+    el('td', {}, i.request ? el('div', {}, pill(i.request.status === 'declined' ? 'gap' : 'close', { pending: 'Requested, awaiting candidate', accepted: 'Candidate accepted', declined: 'Candidate declined', submitted: 'Answer submitted, not scored' }[i.request.status]),
+        i.request.submission && i.request.submission.answer ? el('details', {}, el('summary', {}, 'Read the answer'), el('p', { style: 'white-space:pre-wrap' }, i.request.submission.answer)) : null)
+      : el('button', { class: 'btn small secondary', onclick: async () => {
+        await guarded(out, async () => { await api(`/share/${token}/request`, 'POST', { skill: i.skill, requested_by: by.value }); renderEmployer(token); });
+      } }, 'Request assessment'))));
+  app.replaceChildren(
+    el('h2', {}, `${a.display_name} · ${a.title}`),
+    el('p', { class: 'muted' }, 'The candidate stated each level and can change it. “Evidence supports” is what their CV, self-assessments, badges and references support. There is no overall score or ranking. A difference between the two columns is a reason to ask for an assessment, which the candidate may accept or decline.'),
+    el('div', { class: 'card kpis' },
+      el('div', { class: 'kpi' }, el('span', { class: 'muted small' }, 'Must-haves stated as met'), el('b', {}, `${a.summary.mustHaveStated}/${a.summary.mustHaveTotal}`)),
+      el('div', { class: 'kpi' }, el('span', { class: 'muted small' }, 'Must-haves supported by evidence'), el('b', {}, `${a.summary.mustHaveEvidenced}/${a.summary.mustHaveTotal}`)),
+      el('div', { class: 'kpi' }, el('span', { class: 'muted small' }, 'Levels stated above evidence'), el('b', {}, a.summary.flagged))),
+    el('div', { class: 'card' }, el('table', {}, el('thead', {}, el('tr', {}, ['Requirement', 'Asked', 'Stated', 'Evidence supports', 'Flag', 'Candidate’s plan', 'Assessment'].map((h) => el('th', {}, h)))), el('tbody', {}, rows))),
+    el('div', { class: 'row' }, el('div', { class: 'grow' }, el('label', {}, 'Requested by'), by)), out,
+    el('p', { class: 'muted small' }, 'Assessment tasks are not scored yet. A hiring decision should rest on people, not on this page.'),
   );
 }
 
@@ -320,6 +471,8 @@ async function renderEvidence() {
 (async () => {
   try {
     [state.cfg, state.ont] = await Promise.all([api('/config'), api('/ontology')]);
+    const share = new URLSearchParams(location.search).get('share');
+    if (share) { document.getElementById('who').replaceChildren(); return await renderEmployer(share); }
     await start();
   } catch (e) { app.replaceChildren(msg(`Could not start: ${e.message}`)); }
 })();
